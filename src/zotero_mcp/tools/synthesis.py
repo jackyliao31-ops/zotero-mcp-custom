@@ -16,7 +16,9 @@ from zotero_mcp._app import mcp
 from zotero_mcp._context import Context
 from zotero_mcp.client import with_zotero_api_lock
 from zotero_mcp.tools import _helpers
+from zotero_mcp.tools import retrieval as _retrieval
 from zotero_mcp.tools.annotations import _annotation_to_record
+from zotero_mcp.tools.retrieval import _is_top_level_item
 
 
 def _resolve_paper_context(
@@ -478,3 +480,142 @@ def export_bibliography(
     except Exception as e:
         ctx.error(f"Error exporting bibliography: {str(e)}")
         return f"Error exporting bibliography: {str(e)}"
+
+
+@mcp.tool(
+    name="zotero_synthesize_collection",
+    description=(
+        "Gather every paper in a collection — metadata, abstract, and "
+        "(optionally) extracted full text — into ONE structured digest so "
+        "YOU (the agent) can build a literature-review comparison table "
+        "(method, sample, findings, relevance to the user's question) "
+        "without calling a per-item tool once per paper. This tool does "
+        "NOT call an LLM itself; like zotero_synthesize_annotations, it "
+        "only collects and formats — the synthesis step is yours. "
+        "collection_key: the 8-character collection key (see "
+        "zotero_search_collections). "
+        "include_fulltext=False (default) includes title/authors/date/"
+        "abstract only — fast, good for a first-pass comparison table. Set "
+        "True to also extract each paper's full text via the same path as "
+        "zotero_get_item_fulltext (local storage / server index / "
+        "download+convert), which is far slower and produces a much "
+        "larger response; each paper's extracted text is capped at "
+        "fulltext_max_chars to keep the combined digest usable — read one "
+        "paper in full with zotero_get_item_fulltext if you need more. "
+        "fulltext_max_chars: per-paper cap on extracted full-text length "
+        "when include_fulltext=True (default 3000, max 20000). "
+        "limit: maximum number of papers to include (default 20, capped "
+        "at 50) — scope to a smaller collection or raise cautiously, "
+        "since include_fulltext=True on many papers is slow. "
+        "A paper whose text or metadata can't be read is skipped with an "
+        "inline note rather than failing the whole call. "
+        "Example: zotero_synthesize_collection(collection_key='MT53KB66', "
+        "include_fulltext=True, limit=15)."
+    ),
+)
+@with_zotero_api_lock
+def synthesize_collection(
+    collection_key: str,
+    include_fulltext: bool = False,
+    fulltext_max_chars: int | str | None = 3000,
+    limit: int | str | None = 20,
+    *,
+    ctx: Context,
+) -> str:
+    """Gather every paper in a collection into one digest for synthesis.
+
+    Args:
+        collection_key: Collection to digest.
+        include_fulltext: Also extract each paper's full text (slow).
+        fulltext_max_chars: Per-paper cap on extracted text length.
+        limit: Maximum number of papers to include.
+        ctx: MCP context.
+
+    Returns:
+        Markdown digest, one section per paper.
+    """
+    try:
+        zot = _client.get_zotero_client()
+
+        try:
+            collection = zot.collection(collection_key)
+            collection_name = collection["data"].get("name", "Unnamed Collection")
+        except Exception as e:
+            ctx.error(f"Collection lookup failed for {collection_key}: {e}")
+            return (
+                f"Collection not found or not yet accessible: `{collection_key}`. "
+                f"If you just created this collection, wait a moment and try again."
+            )
+
+        limit = _helpers._normalize_limit(limit, default=20, max_val=50)
+        max_chars = _helpers._normalize_limit(
+            fulltext_max_chars, default=3000, max_val=20000
+        )
+
+        ctx.info(
+            f"Gathering {'full text' if include_fulltext else 'metadata'} "
+            f"for collection {collection_key}"
+        )
+        all_items = _helpers._paginate(zot.collection_items, collection_key)
+        papers = [item for item in all_items if _is_top_level_item(item)]
+        if not papers:
+            return f"No items found in collection: {collection_name} (Key: {collection_key})"
+
+        total_papers = len(papers)
+        truncated = total_papers > limit
+        papers = papers[:limit]
+
+        header = f"# Collection Digest: {collection_name} ({len(papers)}"
+        header += f" of {total_papers}" if truncated else ""
+        header += " papers)"
+        sections = [header, ""]
+
+        error_count = 0
+        for i, item in enumerate(papers, 1):
+            key = item.get("key", "")
+            data = item.get("data", {})
+            title = data.get("title") or data.get("filename") or "Untitled"
+            ctx.info(f"[{i}/{len(papers)}] {title}")
+            sections.append(f"## {i}. {title} (`{key}`)")
+            try:
+                if include_fulltext:
+                    block = _retrieval.get_item_fulltext(key, ctx=ctx)
+                    if len(block) > max_chars:
+                        block = (
+                            block[:max_chars]
+                            + f"\n\n*[truncated at {max_chars} chars — call "
+                            f"zotero_get_item_fulltext(item_key='{key}') for the rest]*"
+                        )
+                else:
+                    block = _client.format_item_metadata(item, include_abstract=True)
+            except Exception as e:
+                block = f"*Could not read this paper: {e}*"
+                error_count += 1
+            sections.append(block)
+            sections.append("")
+
+        if error_count:
+            sections.append(
+                f"*{error_count} of {len(papers)} papers could not be fully read; "
+                "see the notes above.*"
+            )
+        if truncated:
+            sections.append(
+                f"*Showing {len(papers)} of {total_papers} papers. Increase the "
+                "limit parameter to see more.*"
+            )
+
+        sections.append(
+            "*Build your comparison table (method, sample, findings, and "
+            "relevance to the research question) from the material above.*"
+        )
+
+        result = "\n".join(sections)
+        return _helpers._prepend_size_warning(
+            result,
+            "Lower limit, or leave include_fulltext=False, for a lighter digest.",
+        )
+
+    except Exception as e:
+        ctx.error(f"Error synthesizing collection: {str(e)}")
+        return f"Error synthesizing collection: {str(e)}"
